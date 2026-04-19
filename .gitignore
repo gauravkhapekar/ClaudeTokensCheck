@@ -1,0 +1,21 @@
+# Generated data files — contain personal usage history and session details
+data/archive.json
+data/live_usage.json
+data/last_sync.txt
+live_usage.js
+live_usage.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Claude Code local settings
+.claude/
+
+# Original design zip (large, not needed in repo)
+project\ -\ Claude\ usage.zip
+project_claude_usage/
