@@ -929,9 +929,15 @@ function Heatmap({ data }) {
   // Values are already normalised 0–1 with mean+2σ ceiling by filteredData
   const max = 1;
   const hours = [0, 3, 6, 9, 12, 15, 18, 21];
-  const dayLabels = (data.days && data.days.length === 7)
-    ? data.days.map(iso => new Date(iso).toLocaleDateString('en-US', { weekday: 'short' }))
-    : ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  // days array is Mon→today (variable length). Derive all 7 weekday labels from days[0] (Monday).
+  const dayLabels = (() => {
+    const fallback = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    if (!data.days || !data.days.length) return fallback;
+    const mon = new Date(data.days[0]);
+    return Array.from({ length: 7 }, (_, i) =>
+      new Date(mon.getTime() + i * 86400000).toLocaleDateString('en-US', { weekday: 'short' })
+    );
+  })();
   const [hover, setHover] = useState(null);
 
   return (
@@ -1388,13 +1394,34 @@ function buildDailyJS(sessions, rangeKey) {
   const DAY_NAMES = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 
   const makeBucket = (dateMs, endMs, label, dateLabel, future) => {
-    const ss = sessions.filter(s => { const t = new Date(s.start).getTime(); return t >= dateMs && t < endMs; });
-    const inTok  = ss.reduce((a, x) => a + x.inputTokens,  0);
-    const outTok = ss.reduce((a, x) => a + x.outputTokens, 0);
+    // Build set of local date strings (YYYY-MM-DD) that fall within this bucket
+    const localDates = new Set();
+    for (let t = dateMs; t < endMs; t += 86400000)
+      localDates.add(new Date(t).toLocaleDateString('en-CA'));
+
+    let inTok = 0, outTok = 0, cost = 0, sessCount = 0;
+    sessions.forEach(s => {
+      const daily = s.dailyTokens;
+      if (daily) {
+        let hit = false;
+        Object.entries(daily).forEach(([dateStr, d]) => {
+          if (localDates.has(dateStr)) {
+            inTok += d.inputTokens; outTok += d.outputTokens; cost += d.cost; hit = true;
+          }
+        });
+        if (hit) sessCount++;
+      } else {
+        // Fallback for sessions without dailyTokens
+        const t = new Date(s.start).getTime();
+        if (t >= dateMs && t < endMs) {
+          inTok += s.inputTokens; outTok += s.outputTokens; cost += s.cost; sessCount++;
+        }
+      }
+    });
     return {
       date: new Date(dateMs).toISOString(), label, dateLabel: dateLabel || label,
       inputTokens: inTok, outputTokens: outTok, totalTokens: inTok + outTok,
-      cost: ss.reduce((a, x) => a + x.cost, 0), sessions: ss.length,
+      cost, sessions: sessCount,
       ...(future ? { future: true } : {}),
     };
   };

@@ -28,8 +28,17 @@ OS = platform.system()  # 'Windows', 'Darwin', 'Linux'
 _DAY_FMT = '%#d' if OS == 'Windows' else '%-d'
 
 def fmt_month_day(dt):
-    """Return e.g. 'Apr 7' with no leading zero on all platforms."""
+    """Return e.g. 'Apr 7' with no leading zero on all platforms. Accepts date or datetime."""
     return dt.strftime(f'%b {_DAY_FMT}')
+
+def parse_local_date(iso_string):
+    """Convert an ISO 8601 timestamp to the user's local calendar date."""
+    dt = datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
+    return dt.astimezone().date()  # converts UTC → local timezone
+
+def local_midnight(d):
+    """Return a timezone-aware datetime at midnight local time on the given date."""
+    return datetime.combine(d, datetime.min.time()).astimezone()
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -187,20 +196,29 @@ def aggregate_turns(turns):
     """Sum tokens/cost from a list of assistant turns. Returns a partial dict."""
     total_input  = total_output = total_cost = 0
     model_votes  = defaultdict(int)
+    daily        = defaultdict(lambda: {"inputTokens": 0, "outputTokens": 0, "cost": 0.0})
 
     for t in turns:
         msg   = t.get("message", {})
         usage = msg.get("usage", {})
         mk    = model_key(msg.get("model", ""))
         model_votes[mk] += 1
-        total_input  += usage.get("input_tokens",               0) or 0
-        total_output += usage.get("output_tokens",              0) or 0
-        total_cost   += turn_cost(usage, mk)
+        in_tok  = usage.get("input_tokens",  0) or 0
+        out_tok = usage.get("output_tokens", 0) or 0
+        c       = turn_cost(usage, mk)
+        total_input  += in_tok
+        total_output += out_tok
+        total_cost   += c
+        # Track per-day breakdown using the turn's local date
+        local_date = t["_ts"].astimezone().date().isoformat()
+        daily[local_date]["inputTokens"]  += in_tok
+        daily[local_date]["outputTokens"] += out_tok
+        daily[local_date]["cost"]         += c
 
     model = max(model_votes, key=model_votes.get) if model_votes else "sonnet"
     return {"inputTokens": total_input, "outputTokens": total_output,
             "totalTokens": total_input + total_output, "cost": total_cost,
-            "model": model, "turns": len(turns)}
+            "model": model, "turns": len(turns), "dailyTokens": dict(daily)}
 
 def title_from_turns(sid, turns):
     for t in reversed(turns):
@@ -246,6 +264,7 @@ def merge_into_archive(archive, new_buckets):
                 "spike":        False,
                 "heavy":        total_tokens > 280_000,
                 "dayIndex":     first_ts.astimezone().weekday(),  # local-time weekday, Mon=0
+                "dailyTokens":  agg["dailyTokens"],
             }
             added += 1
         else:
@@ -257,6 +276,16 @@ def merge_into_archive(archive, new_buckets):
             ex["cost"]         += agg["cost"]
             ex["turns"]        += agg["turns"]
             ex["heavy"]         = ex["totalTokens"] > 280_000
+
+            # Merge new daily breakdown into existing
+            existing_daily = ex.setdefault("dailyTokens", {})
+            for date_str, d in agg["dailyTokens"].items():
+                if date_str in existing_daily:
+                    existing_daily[date_str]["inputTokens"]  += d["inputTokens"]
+                    existing_daily[date_str]["outputTokens"] += d["outputTokens"]
+                    existing_daily[date_str]["cost"]         += d["cost"]
+                else:
+                    existing_daily[date_str] = dict(d)
 
             # Extend end time if these turns are later
             if last_ts.isoformat() > ex["end"]:
@@ -318,13 +347,63 @@ def get_range_bounds(range_key, now):
 
     return start, end, prev_start, prev_end
 
+# ── Backfill ──────────────────────────────────────────────────────────────────
+
+def backfill_daily_tokens(archive):
+    """One-time: rebuild dailyTokens for any session that's missing it by re-scanning JSONL."""
+    needs = {sid for sid, s in archive.items() if "dailyTokens" not in s}
+    if not needs:
+        return
+    print(f"Backfilling dailyTokens for {len(needs)} older session(s) — one-time scan…")
+    epoch = datetime.fromtimestamp(0, tz=timezone.utc)
+    all_buckets = scan_new_turns(epoch)
+    for sid in needs:
+        turns = sorted(all_buckets.get(sid, []), key=lambda e: e["_ts"])
+        daily = defaultdict(lambda: {"inputTokens": 0, "outputTokens": 0, "cost": 0.0})
+        for t in turns:
+            local_date = t["_ts"].astimezone().date().isoformat()
+            msg   = t.get("message", {})
+            usage = msg.get("usage", {})
+            mk    = model_key(msg.get("model", ""))
+            in_tok  = usage.get("input_tokens",  0) or 0
+            out_tok = usage.get("output_tokens", 0) or 0
+            daily[local_date]["inputTokens"]  += in_tok
+            daily[local_date]["outputTokens"] += out_tok
+            daily[local_date]["cost"]         += turn_cost(usage, mk)
+        archive[sid]["dailyTokens"] = dict(daily)
+
 # ── Output builders ───────────────────────────────────────────────────────────
 
 def _bucket_entry(bucket_start, bucket_end, label, date_label, sessions):
-    ss      = [s for s in sessions
-               if bucket_start <= parse_iso(s["start"]) < bucket_end]
-    in_tok  = sum(s["inputTokens"]  for s in ss)
-    out_tok = sum(s["outputTokens"] for s in ss)
+    """Sum tokens for a time bucket using per-day turn data (dailyTokens)."""
+    # Collect all local date strings that fall within this bucket
+    bucket_dates = set()
+    d = bucket_start
+    while d < bucket_end:
+        bucket_dates.add(d.astimezone().date().isoformat())
+        d += timedelta(days=1)
+
+    in_tok = out_tok = cost = session_count = 0
+    for s in sessions:
+        daily = s.get("dailyTokens")
+        if daily:
+            hit = False
+            for date_str, dd in daily.items():
+                if date_str in bucket_dates:
+                    in_tok  += dd["inputTokens"]
+                    out_tok += dd["outputTokens"]
+                    cost    += dd["cost"]
+                    hit      = True
+            if hit:
+                session_count += 1
+        else:
+            # Fallback for sessions backfilled with empty dailyTokens
+            if bucket_start <= parse_iso(s["start"]) < bucket_end:
+                in_tok        += s["inputTokens"]
+                out_tok       += s["outputTokens"]
+                cost          += s["cost"]
+                session_count += 1
+
     return {
         "date":         bucket_start.isoformat(),
         "label":        label,
@@ -332,8 +411,8 @@ def _bucket_entry(bucket_start, bucket_end, label, date_label, sessions):
         "inputTokens":  in_tok,
         "outputTokens": out_tok,
         "totalTokens":  in_tok + out_tok,
-        "cost":         sum(s["cost"] for s in ss),
-        "sessions":     len(ss),
+        "cost":         cost,
+        "sessions":     session_count,
     }
 
 def build_daily(sessions, range_key, start, end, now=None):
@@ -347,11 +426,16 @@ def build_daily(sessions, range_key, start, end, now=None):
 
     if range_key == 'week':
         day_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        # Use LOCAL date for today so timezone± users see the correct current day
+        local_today  = now.astimezone().date()
+        local_monday = local_today - timedelta(days=local_today.weekday())
         for i in range(7):
-            d = start + timedelta(days=i)
-            d_end = d + timedelta(days=1)
-            entry = _bucket_entry(d, d_end, day_labels[i], fmt_month_day(d), sessions)
-            if d.date() > now.date():
+            local_day = local_monday + timedelta(days=i)
+            # Bucket boundaries at local midnight so sessions near midnight land on the right day
+            d_start = local_midnight(local_day)
+            d_end   = d_start + timedelta(days=1)
+            entry = _bucket_entry(d_start, d_end, day_labels[i], fmt_month_day(local_day), sessions)
+            if local_day > local_today:
                 entry["future"] = True
             result.append(entry)
 
@@ -444,6 +528,9 @@ def main():
     print(f"Last sync: {'never — full scan' if first_run else last_sync.strftime('%b %d %Y %H:%M UTC')}")
     print(f"Archive  : {len(archive)} sessions on disk")
 
+    # ── Step 1b: backfill dailyTokens for any old sessions that lack it ───────
+    backfill_daily_tokens(archive)
+
     # ── Step 2: scan for new turns ────────────────────────────────────────────
     new_buckets  = scan_new_turns(last_sync)
     new_turn_cnt = sum(len(v) for v in new_buckets.values())
@@ -474,11 +561,16 @@ def main():
     # ── Step 6: write live_usage.js ───────────────────────────────────────────
     price_for_js = {k: {"in": v["in"], "out": v["out"]} for k, v in PRICE.items()}
 
-    # Build days array: 7 ISO strings for Mon–Sun of the current week (UTC midnight)
-    week_mon = (now - timedelta(days=now.weekday())).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    days = [(week_mon + timedelta(days=i)).isoformat() for i in range(7)]
+    # Build days array: local-midnight ISO strings Mon → today (never beyond today)
+    # Uses local date so UTC± users see the correct current day
+    local_today  = now.astimezone().date()
+    local_monday = local_today - timedelta(days=local_today.weekday())
+    days = []
+    d = local_monday
+    while d <= local_today:          # <= includes today, never exceeds it
+        days.append(local_midnight(d).isoformat())
+        d += timedelta(days=1)
+    week_mon = local_monday          # used in summary print below
 
     daily_data = build_daily(sessions, range_key, start, end, now=now)
 
@@ -523,8 +615,10 @@ def main():
 
     print()
     print("─" * 46)
+    day_start_str = week_mon.strftime(f"%a %b {_DAY_FMT}")
+    day_end_str   = local_today.strftime(f"%a %b {_DAY_FMT}")
     print(f"  Range     {RANGE_LABELS[range_key]}")
-    print(f"  Week starts: {week_mon.strftime('%Y-%m-%d')}, Today: {now.strftime('%Y-%m-%d')}, Days included: {days_included}")
+    print(f"  Days in range: {day_start_str} → {day_end_str} ({days_included} days)")
     print(f"  Sessions  {len(sessions)}")
     print(f"  Tokens    {total_tok:>18,}")
     print(f"  Cost      {'${:.4f}'.format(total_cost):>18}")
